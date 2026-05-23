@@ -1,0 +1,276 @@
+# =============================================================
+# .github/workflows/cicd.yml
+# Full CI/CD pipeline: Lint → Build → Scan → Push → Deploy
+# Triggers on every push to the main branch.
+# =============================================================
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/cicd-demo-app
+  IMAGE_TAG:  ${{ github.sha }}
+
+jobs:
+
+  # ============================================================
+  # STAGE 1 — Linting & Secret Scanning
+  # ============================================================
+  lint-and-secret-scan:
+    name: "Stage 1 · Lint & Secret Scan"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # Full history required by some secret scanners
+
+      # --- Python linting with Flake8 ---
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install linting dependencies
+        run: pip install flake8
+
+      - name: Run Flake8 (code-quality lint)
+        run: |
+          flake8 app/ \
+            --max-line-length=120 \
+            --exclude=__pycache__ \
+            --format="::error file=%(path)s,line=%(row)d,col=%(col)d::%(text)s"
+
+      # --- Dockerfile linting with Hadolint ---
+      - name: Lint Dockerfile with Hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+
+      # --- Secret scanning with Gitleaks ---
+      - name: Scan for leaked secrets (Gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ============================================================
+  # STAGE 2 — Build Docker Image
+  # ============================================================
+  build:
+    name: "Stage 2 · Build Docker Image"
+    runs-on: ubuntu-latest
+    needs: lint-and-secret-scan
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image (no push yet)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          # Cache layers to speed up subsequent builds
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+          # Export image to Docker daemon for the next scan stage
+          load: true
+
+      - name: Save image as tarball for the scan stage
+        run: docker save ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} -o image.tar
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: image.tar
+          retention-days: 1
+
+  # ============================================================
+  # STAGE 3 — Security Scanning (Shift Left with Trivy)
+  # ============================================================
+  security-scan:
+    name: "Stage 3 · Security Scan (Trivy)"
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Load Docker image
+        run: docker load -i image.tar
+
+      # Trivy scans for CVEs in OS packages and Python dependencies.
+      # The pipeline FAILS if any CRITICAL vulnerability is found.
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref:    "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          format:       "table"
+          exit-code:    "1"          # Fail the pipeline on critical findings
+          severity:     "CRITICAL,HIGH"
+          ignore-unfixed: true       # Skip CVEs with no patch available
+
+      # Also scan the filesystem/repo for misconfigurations
+      - name: Run Trivy filesystem scan (IaC & repo)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type:  "fs"
+          scan-ref:   "."
+          format:     "table"
+          severity:   "CRITICAL,HIGH"
+          exit-code:  "0"            # Warn only; don't fail on IaC findings
+
+  # ============================================================
+  # STAGE 4 — Push to Docker Hub
+  # ============================================================
+  push:
+    name: "Stage 4 · Push to Registry"
+    runs-on: ubuntu-latest
+    needs: security-scan
+    # Only push on direct pushes to main (not on PRs)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build AND push (using cached layers from Stage 2)
+      - name: Build & Push image (commit SHA tag + latest)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+            ${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+  # ============================================================
+  # STAGE 5 — Deploy (Rolling Update via Terraform + SSH)
+  # ============================================================
+  deploy:
+    name: "Stage 5 · Deploy (Rolling Update)"
+    runs-on: ubuntu-latest
+    needs: push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      # --- Provision / update infrastructure with Terraform ---
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.8.0"
+
+      - name: Terraform Init
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: terraform init
+
+      - name: Terraform Plan
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          terraform plan \
+            -var="docker_image=${{ env.IMAGE_NAME }}" \
+            -var="app_version=${{ env.IMAGE_TAG }}" \
+            -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: terraform apply -auto-approve tfplan
+
+      # --- Zero-downtime rolling update on the EC2 host ---
+      # The script:
+      #   1. Pulls the new image
+      #   2. Starts a new container on a temporary port
+      #   3. Waits for /health to return 200
+      #   4. Swaps the container (stops old, renames new)
+      - name: Rolling update on EC2 via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:     ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key:      ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            IMAGE="${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+
+            echo "Pulling new image: $IMAGE"
+            docker pull $IMAGE
+
+            echo "Starting new container on staging port 5001..."
+            docker run -d \
+              --name app_new \
+              -p 5001:5000 \
+              -e APP_VERSION=${{ env.IMAGE_TAG }} \
+              --health-cmd="curl -f http://localhost:5000/health || exit 1" \
+              --health-interval=10s \
+              --health-timeout=5s \
+              --health-retries=5 \
+              $IMAGE
+
+            echo "Waiting for health check to pass..."
+            for i in $(seq 1 30); do
+              STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:5001/health)
+              if [ "$STATUS" = "200" ]; then
+                echo "Health check passed!"
+                break
+              fi
+              echo "Attempt $i: status=$STATUS, retrying in 5s..."
+              sleep 5
+              if [ "$i" = "30" ]; then
+                echo "Health check FAILED. Rolling back."
+                docker rm -f app_new
+                exit 1
+              fi
+            done
+
+            echo "Swapping containers..."
+            docker rm -f app || true
+            docker rename app_new app
+            docker stop app
+            docker run -d \
+              --name app \
+              --restart unless-stopped \
+              -p 80:5000 \
+              -e APP_VERSION=${{ env.IMAGE_TAG }} \
+              $IMAGE
+
+            echo "Cleaning up old images..."
+            docker image prune -f
+            echo "Deployment complete!"
